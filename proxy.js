@@ -42,6 +42,7 @@ function sendCancel(rq, via) {
     headers: {
       via: [via],
       to: rq.headers.to,
+      route: rq.headers.route,
       from: rq.headers.from,
       'call-id': rq.headers['call-id'],
       cseq: {method: 'CANCEL', seq: rq.headers.cseq.seq}
@@ -55,7 +56,6 @@ function forwardRequest(ctx, rq, callback) {
     if(+rs.status < 200) {
       var via = rs.headers.via[0];
       ctx.cancellers[rs.headers.via[0].params.branch] = function() { sendCancel(rq, via); };
-
       if(ctx.cancelled)
         sendCancel(rq, via);
     }
@@ -82,7 +82,7 @@ function onRequest(rq, route, remote) {
 
 
 exports.start = function(options, route) {
-  sip.start(options, function(rq) {
+  sip.start(options, function(rq, flow) {
     if(rq.method === 'CANCEL') {
       var ctx = contexts[makeContextId(rq)];
 
@@ -99,7 +99,7 @@ exports.start = function(options, route) {
       }
     }
     else {
-      onRequest(rq, route);
+      onRequest(rq, route, flow);
     }
   });
 };

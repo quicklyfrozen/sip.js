@@ -3,122 +3,13 @@ var net = require('net');
 var dns = require('dns');
 var assert = require('assert');
 var dgram = require('dgram');
+var crypto = require('crypto');
+var os = require('os');
 
-var v05 = !(process.version < 'v0.5.0');
-
-//Various utility stuff
-
-if(!v05) {
-//node.js 'dgram' module do not allow proper ICMP errors handling
-var udp = (function() {
-  var events = require('events');
-
-  try {
-    var IOWatcher    = process.binding('io_watcher').IOWatcher;
-  } 
-  catch(e) {
-    var IOWatcher    = process.IOWatcher;
-  }
-  var binding      = process.binding('net');
-  var socket       = binding.socket;
-  var recvfrom     = binding.recvfrom;
-  var close        = binding.close;
-
-  var pool = null;
-
-  function getPool() {
-    var minPoolAvail = 1024 * 8;
-
-    var poolSize = 1024 * 64;
-
-    if (pool === null || (pool.used + minPoolAvail  > pool.length)) {
-      pool = new Buffer(poolSize);
-      pool.used = 0;
-    }
-
-    return pool;
-  }
-
-  function Socket(listener) {
-    events.EventEmitter.call(this);
-    var self = this;
-    self.fd = socket('udp4');
-
-    if(typeof listener === 'function')
-      self.on('message', listener);
-
-    self.watcher = new IOWatcher();
-    self.watcher.host = self;
-    self.watcher.callback = function() {
-      try {
-        while(self.fd) {
-          var p = getPool();
-          var rinfo = recvfrom(self.fd, p, p.used, p.length-p.used, 0);
-       
-          if(!rinfo) return;
-
-          self.emit('message', p.slice(p.used, p.used + rinfo.size), rinfo);
-
-          p.used += rinfo.size;
-        }
-      }
-      catch(e) {
-        self.emit('error', e);
-      } 
-    };
-
-    self.watcher.set(this.fd, true, false); 
-    self.watcher.start(); 
-  }
-
-  util.inherits(Socket, events.EventEmitter); 
-
-  Socket.prototype.bind = function(port, address) {
-    binding.bind(this.fd, port, address);
-    this.emit('listening');
-  }
-
-  Socket.prototype.connect = function(port, address) {
-    binding.connect(this.fd, port, address);
-  }
-
-  Socket.prototype.address = function () {
-    return binding.getsockname(this.fd);
-  };
-
-  Socket.prototype.send = function(buffer, offset, length, callback) {
-    if (typeof offset !== "number" || typeof length !== "number") {
-      throw new Error("send takes offset and length as args 2 and 3");
-    }
-
-    try {
-      var bytes = binding.sendMsg(this.fd, buffer, offset, length);
-    }
-    catch(err) {
-      if (callback) {
-        callback(err);
-      }
-      return;
-    }
- 
-    if(callback) {
-      callback(null, bytes);
-    }
-  };
-
-  Socket.prototype.close = function () {
-    if (!this.fd) throw new Error('Not running');
-
-    this.watcher.stop();
-
-    close(this.fd);
-    this.fd = null;
-
-    this.emit("close");
-  };
-
-  return { createSocket: function(listener) { return new Socket(listener); } };
-})();
+try {
+var WebSocket = require('ws');
+}
+catch(e) {
 }
 
 function debug(e) {
@@ -128,8 +19,6 @@ function debug(e) {
   else
     util.debug(util.inspect(e));
 }
-
-// Actual stack code begins here
 
 function parseResponse(rs, m) {
   var r = rs.match(/^SIP\/(\d+\.\d+)\s+(\d+)\s*(.*)\s*$/);
@@ -562,87 +451,115 @@ function parseMessage(s) {
 exports.parse = parseMessage;
 
 function makeTcpTransport(options, callback) {
-  var connections = Object.create(null);
+  var remotes = Object.create(null);
+  var flows = Object.create(null);
 
-  function init(stream, remote) {
-    var id = [remote.address, remote.port].join(),
-        local = {protocol: 'TCP', address: stream.address() && stream.address().address, port: stream.address() && stream.address().port},
-        pending = [],
-        refs = 0;
+  function init(socket) {
+    var remote = {procotol: 'TCP', address: socket.remoteAddress, port: socket.remotePort },
+        local = {protocol: 'TCP', address: socket.address().address, port: socket.address().port},
+        remote_id = [remote.address, remote.port].join(),
+        flow_id = [remote.address, remote.port, local.address, local.port].join();
+        refs = 0,
+        self;
+   
+    socket.setEncoding('ascii');
+
+    socket.on('data', makeStreamParser(function(m) { 
+      if(m.method) m.headers.via[0].params.received = socket.remoteAddress;
+      callback(m, remote, local);
+    }));
+
+    socket.on('close',    function() { 
+      if(remotes[remote_id] === self) delete remotes[remote_id];
+      delete flows[flow_id];
+    });
+
+    socket.on('error',    function() {});
+    socket.on('end',      function() { if(refs === 0) stream.end(); });
+    socket.on('timeout',  function() { if(refs === 0) stream.end(); });
+    socket.setTimeout(60000);   
+    socket.setMaxListeners(10000);
 
     function send(m) {
       try {
-        if(stream.readyState === 'opening')
-          pending.push(m);
-        else {
-          if(m.method) m.headers.via[0].host = stream.address().address;
-          stream.write(stringify(m), 'ascii');
-        }
+        if(m.method) m.headers.via[0].host = socket.address().address;
+        socket.write(stringify(m), 'ascii');
       }
       catch(e) {
-        process.nextTick(stream.emit.bind(stream, 'error', e));
+        process.nextTick(socket.emit.bind(socket, 'error', e));
+      }
+    } 
+    
+    self = remotes[remote_id] = flows[flow_id] = function(error) {
+      ++refs;
+      if(error) socket.on('error', error);
+      return {
+        send: send,
+        release: function() {
+          --refs;
+          if(error) socket.removeListener('error', error);
+        },
+        local: local 
       }
     }
-    
-    stream.setEncoding('ascii');
 
-    stream.on('data', makeStreamParser(function(m) { 
-      if(m.method) m.headers.via[0].params.received = remote.address;
-      callback(m, remote); 
-    }));
-
-    stream.on('close',    function() { delete connections[id]; });
-    stream.on('error',    function() {});
-    stream.on('end',      function() { if(refs === 0) stream.end(); });
-    stream.on('timeout',  function() { if(refs === 0) stream.end(); });
-    stream.on('connect',  function() { pending.splice(0).forEach(send); });
-    stream.setTimeout(60000);   
-    stream.setMaxListeners(10000);
- 
-    connections[id] = function(onError) {
-      ++refs;
-      if(onError) stream.on('error', onError);
-
-      return {
-        release: function() {
-          if(onError) stream.removeListener('error', onError);
-
-          if(--refs === 0) {
-            if(stream.readyState === 'writeOnly')
-              stream.end();
-            else
-              stream.setTimeout(60000);
-          }
-        },
-        send: send,
-        local: local
-      }
-    };
-
-    return connections[id];
+    return self;
   }
   
-  var server = net.createServer(function(stream) {
-    init(stream, {protocol: 'TCP', address: stream.remoteAddress, port: stream.remotePort});
-  });
-
+  var server = net.createServer(function(stream) { init(stream); }); 
   server.listen(options.port || 5060, options.address);
 
   return {
-    open: function(remote, error, dontopen) {
-      var id = [remote.address, remote.port].join();
-
-      if(id in connections) return connections[id](error);
-
-      if(dontopen) return null;
-
-      return init(net.connect(remote.port, remote.address), remote)(error);
+    open: function(target, error) {
+      if(target.local) {
+        var flow = flows[[target.remote.address, target.remote.port, target.local.address, target.local.port].join()];
+        if(flow) return flow(error);
+      }
+      else 
+        return (remotes[target.remote.address, target.remote.port].join() || init(net.connect(target.remote.port, target.remote.address)))(error);
     },
     destroy: function() { server.close(); }
   }
 }
 
-function makeUdpTransport_V0_5(options, callback) {
+function makeWsTransport(options, callback) {
+  var flows = Object.create(null);
+
+  var server = new WebSocket.Server({port:options.ws_port});
+  server.on('connection', function(ws) {
+    var remote = {address: ws._socket.remoteAddress, port: ws._socket.remotePort},
+        local = {address: ws._socket.address().address, port: ws._socket.address().port}
+        flowid = [remote.address, remote.port, local.address, local.port].join();
+
+    flows[flowid] = ws;
+
+    ws.on('close', function() { delete flows[flowid]; });
+    ws.on('message', function(data) {
+      var msg = parseMessage(data);
+      if(msg) {
+        callback(msg, {protocol: 'WS', local: local, remote: remote});
+      }
+    });
+  });
+
+  return {
+    open: function(flow, error) {
+      var ws = flows[[flow.remote.address, flow.remote.port, flow.local.address, flow.local.port].join()];
+      if(ws) {
+        return {
+          send: function(m) {
+            ws.send(stringify(m));    
+          },
+          release: function() {},
+          local: { protocol: 'WS', address: ws._socket.address().address, port: ws._socket.address().port } 
+        }
+      }
+    },
+    destroy: function() { server.close(); }
+  }
+}
+
+function makeUdpTransport(options, callback) {
   function onMessage(data, rinfo) {
     var msg = parseMessage(data);
     
@@ -653,7 +570,9 @@ function makeUdpTransport_V0_5(options, callback) {
           msg.headers.via[0].params.rport = rinfo.port;
       }
 
-      callback(msg, {protocol: 'UDP', address: rinfo.address, port: rinfo.port});
+      callback(msg, {protocol: 'UDP',
+        remote: {address: rinfo.address, port: rinfo.port},
+        local: {address: socket.address().address, port: socket.address().port}});
     }
   }
 
@@ -675,81 +594,63 @@ function makeUdpTransport_V0_5(options, callback) {
   }
 }
 
-function makeUdpTransport_pre_V0_5(options, callback) {
-  var connections = Object.create(null);
+function toBase64(s) { 
+  switch(s.length % 3) {
+  case 1:
+    s += '  ';
+    break;
+  case 2:
+    s += ' ';
+    break;
+  default:
+  }
 
-  function listener(data, rinfo) {
-    var msg = parseMessage(data);
-
-    if(msg) {
-      if(msg.method) {
-        msg.headers.via[0].params.received = rinfo.address;
-        if(msg.headers.via[0].params.hasOwnProperty('rport'))
-          msg.headers.via[0].params.rport = rinfo.port;
-      }
-    
-      callback(msg, {protocol: 'UDP', address: rinfo.address, port: rinfo.port});
-    }
-  };
-
-  var socket = udp.createSocket(listener);
-
-  socket.bind(options.port || 5060, options.address);
-  socket.on('error', function() {});
-  
-  function open(remote) {
-    var socket = udp.createSocket(listener),
-        id = [remote.address, remote.port].join(),
-        local,
-        refs = 0,
-        timeout;
-    
-    socket.bind(options.port || 5060, options.address);
-    socket.connect(remote.port, remote.address);
-    
-    local = {protocol: 'UDP', address: socket.address().address, port: socket.address().port};
-    
-    socket.on('error', function() {});
-    socket.on('close', function() { delete connections[id]; });
-
-    return connections[id] = function(onError) {
-      ++refs;
-      
-      if(timeout) {
-        clearTimeout(timeout);
-        timeout = null;
-      }
-
-      if(onError) socket.on('error', onError);
-
-      return { 
-        send: function(m) {
-          var s = stringify(m);
-          socket.send(new Buffer(s, 'ascii'), 0, s.length);
-        },
-        release: function() { 
-          if(onError) socket.removeListener('error', onError);
-          
-          if(--refs === 0)
-            timeout = setTimeout(socket.close.bind(socket), 30000);
-        },
-        local: local
-      };
-    };
-  };
- 
-  return {
-    open: function(remote, error) { 
-      return (connections[[remote.address, remote.port].join()] || open(remote))(error);
-    },
-    destroy: function() { socket.close(); }
-  };
+  return (new Buffer(s)).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
 }
 
-var makeUdpTransport = v05 ? makeUdpTransport_V0_5 : makeUdpTransport_pre_V0_5; 
 
-function makeTransport(options, callback) {
+function makeTransport(options, _callback) {
   var protocols = {};
+  var hostnames = [];
+
+  if(options.hostname || options.hostname === undefined) hostnames.push(options.hostname || os.hostname());
+
+  if(options.address)
+    hostnames.push(options.address);
+  else {
+    var ifs = os.networkInterfaces();
+    Object.keys(ifs).forEach(function(i) {
+      ifs[i].forEach(function(a) { if(!a.internal) hostnames.push(a.address); });
+    });
+  }
+
+  var rbytes = crypto.randomBytes(20);
+
+  function encodeFlowUri(flow) {
+    var s = [flow.protocol, flow.remote.address, flow.remote.port, flow.local.address, flow.local.port].join();
+    var h = crypto.createHmac('sha1', rbytes);
+    h.update(s);
+    return {user: toBase64([h.digest('base64'), s].join()), host: hostnames[0], params: {ob: null}};
+  }
+
+  function decodeFlowUri(uri) {
+    if(uri.params.ob === undefined || hostnames.indexOf(uri.host) === -1)
+      return;
+
+    var s = (new Buffer(uri.user, 'base64')).toString('ascii').split(',');
+    if(s.length != 6) return;
+
+    var flow = {protocol: s[1], remote: {address: s[2], port: +s[3]}, local: {address: s[4], port: +s[5]}};
+
+    return encodeFlowUri(flow).user == uri.user ? flow : undefined;
+  }
+
+  function callback(m, flow) {
+    flow.address = flow.remote.address;
+    flow.port = flow.remote.port;
+    flow.flowUri = encodeFlowUri(flow);
+    _callback(m, flow);
+  }
 
   var callbackAndLog = callback;
   if(options.logger && options.logger.recv) {
@@ -763,6 +664,8 @@ function makeTransport(options, callback) {
     protocols.UDP = makeUdpTransport(options, callbackAndLog); 
   if(options.tcp === undefined || options.tcp)
     protocols.TCP = makeTcpTransport(options, callbackAndLog);
+  if(options.ws_port && WebSocket)
+    protocols.WS = makeWsTransport(options, callbackAndLog);
 
   function wrap(obj, target) {
     return Object.create(obj, {send: {value: function(m) {
@@ -795,6 +698,18 @@ function makeTransport(options, callback) {
       }
       finally {
         cn.release();
+      }
+    },
+    resolve: function(uri, action) {
+      if(uri.params.ob !== undefined) {
+        var flow = decodeFlowUri(uri);
+        if(flow)
+          action([flow])
+        else
+          action([]);
+      }
+      else {
+        resolve(uri, action);
       }
     },
     destroy: function() { 
@@ -1118,7 +1033,7 @@ function makeTransactionId(m) {
 function getNextHop(rq) {
   var hop = parseUri(rq.uri);
 
-  if(rq.headers.route) {
+  if(rq.headers.route && rq.headers.route.length) {
     if(typeof rq.headers.route === 'string')
       rq.headers.route = parsers.route({s: rq.headers.route, i:0});
 
@@ -1133,24 +1048,27 @@ function getNextHop(rq) {
   return hop;
 }
  
-function makeTransactionLayer(options, transport) {
+function makeTransactionLayer(options, transport, resolve) {
   var server_transactions = Object.create(null);
   var client_transactions = Object.create(null);
 
   return {
-    createServerTransaction: function(rq, remote) {
+    createServerTransaction: function(rq, flow) {
       var id = makeTransactionId(rq);
       
-      if(remote.protocol === 'UDP' && !rq.headers.via[0].params.hasOwnProperty('rport'))
-        remote = {protocol: 'UDP', port: rq.headers.via[0].port || 5060, address: remote.address};
+      if(flow.protocol === 'UDP' && !rq.headers.via[0].params.hasOwnProperty('rport'))
+        flow.remote = rq.headers.via[0].port || 5060;
 
-      var cn = transport(remote, function() {}, true);
-      return server_transactions[id] = (rq.method === 'INVITE' ? createInviteServerTransaction : createServerTransaction)(
-        cn.send.bind(cn),
-        function() { 
-          delete server_transactions[id];
-          cn.release();
-        });
+      var cn = transport(flow);
+      if(cn) {
+        return server_transactions[id] = (rq.method === 'INVITE' ? createInviteServerTransaction : createServerTransaction)(
+          cn.send.bind(cn),
+          function() { 
+            delete server_transactions[id];
+            cn.release();
+          }
+        );
+      }
     },
     createClientTransaction: function(rq, callback) {
       if(rq.method !== 'CANCEL') {
@@ -1159,52 +1077,60 @@ function makeTransactionLayer(options, transport) {
         else
           rq.headers.via = [{params:{}}];
       }
-      
-      if(typeof rq.headers.cseq !== 'object')
-        rq.headers.cseq = parseCSeq({s: rq.headers.cseq, i:0});
 
-      var transaction = rq.method === 'INVITE' ? createInviteClientTransaction : createClientTransaction;
+      try { 
+        if(typeof rq.headers.cseq !== 'object')
+          rq.headers.cseq = parseCSeq({s: rq.headers.cseq, i:0});
 
-      resolve(getNextHop(rq), function(address) {
-        var onresponse;
+        var transaction = rq.method === 'INVITE' ? createInviteClientTransaction : createClientTransaction;
 
-        function next() {
-          onresponse = searching;
-          if(address.length > 0) {
-            try {
-              if(rq.method !== 'CANCEL')
-                rq.headers.via[0].params.branch = generateBranch();
+        resolve(getNextHop(rq), function(address) {
+          var onresponse;
+
+          function next() {
+            onresponse = searching;
+            if(address.length > 0) {
+              try {
+                if(rq.method !== 'CANCEL')
+                  rq.headers.via[0].params.branch = generateBranch();
  
-              var id = makeTransactionId(rq);
+                var id = makeTransactionId(rq);
 
-              var cn = transport(address.shift(), function(e) { client_transactions[id].message(makeResponse(rq, 503));}); 
-              var send = cn.send.bind(cn);
-              send.reliable = cn.local.protocol.toUpperCase() !== 'UDP';
+                var cn = transport(address.shift(), function(e) { client_transactions[id].message(makeResponse(rq, 503));}); 
+                var send = cn.send.bind(cn);
+                send.reliable = cn.local.protocol.toUpperCase() !== 'UDP';
 
-              client_transactions[id] = transaction(rq, send, onresponse, function() { 
-                delete client_transactions[id];
-                cn.release();
-              });
+                client_transactions[id] = transaction(rq, send, onresponse, function() { 
+                  delete client_transactions[id];
+                  cn.release();
+                });
+              }
+              catch(e) {
+                if(rq.method !== 'CANCEL') rq.headers.via.shift();
+                onresponse(makeResponse(rq, 503));  
+              }
             }
-            catch(e) {
-              onresponse(makeResponse(rq, 503));  
+            else {
+              if(rq.method !== 'CANCEL') rq.headers.via.shift();
+              onresponse(makeResponse(rq, 404));
             }
           }
-          else
-            onresponse(makeResponse(rq, 404));
-        }
 
-        function searching(rs) {
-          if(rs.status === 503)
-            return next();
-          else if(rs.status > 100)
-            onresponse = callback;
+          function searching(rs) {
+            if(rs.status === 503)
+              return next();
+            else if(rs.status > 100)
+              onresponse = callback;
           
-          callback(rs);
-        }
+            callback(rs);
+          }
         
-        next();
-      });
+          next();
+        });
+      } catch(e) {
+        if(rq.method !== 'CANCEL') rq.headers.via.shift(); 
+        throw e;
+      }
     },
     getServer: function(m) {
       return server_transactions[makeTransactionId(m)];
@@ -1223,16 +1149,19 @@ exports.create = function(options, callback) {
   var transport = makeTransport(options, function(m,remote) {
     try {
       var t = m.method ? transaction.getServer(m) : transaction.getClient(m);
-
+      
       if(!t) {
         if(m.method && m.method !== 'ACK') {
           var t = transaction.createServerTransaction(m,remote);
-          try {
-            callback(m,remote);
-          } catch(e) {
-            t.send(makeResponse(m, '500', 'Internal Server Error'));
-            throw e;
-          } 
+          if(t) {
+            try {
+              callback(m,remote);
+            } catch(e) {
+              errorLog(e);
+              t.send(makeResponse(m, '500', 'Internal Server Error'));
+              throw e;
+            } 
+          }
         }
         else if(m.method === 'ACK') {
           callback(m,remote);
@@ -1247,7 +1176,7 @@ exports.create = function(options, callback) {
     }
   });
   
-  var transaction = makeTransactionLayer(options, transport.open.bind(transport));
+  var transaction = makeTransactionLayer(options, transport.open.bind(transport), transport.resolve.bind(resolve));
 
   return {
     send: function(m, callback) {
