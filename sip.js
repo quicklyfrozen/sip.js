@@ -1071,13 +1071,6 @@ function makeTransactionLayer(options, transport, resolve) {
       }
     },
     createClientTransaction: function(rq, callback) {
-      if(rq.method !== 'CANCEL') {
-        if(rq.headers.via)
-          rq.headers.via.unshift({params:{}});
-        else
-          rq.headers.via = [{params:{}}];
-      }
-
       try { 
         if(typeof rq.headers.cseq !== 'object')
           rq.headers.cseq = parseCSeq({s: rq.headers.cseq, i:0});
@@ -1086,6 +1079,13 @@ function makeTransactionLayer(options, transport, resolve) {
 
         resolve(getNextHop(rq), function(address) {
           var onresponse;
+          
+          if(rq.method !== 'CANCEL') {
+            if(rq.headers.via)
+              rq.headers.via.unshift({params:{}});
+            else
+              rq.headers.via = [{params:{}}];
+          }
 
           function next() {
             onresponse = searching;
@@ -1106,12 +1106,10 @@ function makeTransactionLayer(options, transport, resolve) {
                 });
               }
               catch(e) {
-                if(rq.method !== 'CANCEL') rq.headers.via.shift();
                 onresponse(makeResponse(rq, 503));  
               }
             }
             else {
-              if(rq.method !== 'CANCEL') rq.headers.via.shift();
               onresponse(makeResponse(rq, 404));
             }
           }
@@ -1128,7 +1126,6 @@ function makeTransactionLayer(options, transport, resolve) {
           next();
         });
       } catch(e) {
-        if(rq.method !== 'CANCEL') rq.headers.via.shift(); 
         throw e;
       }
     },
