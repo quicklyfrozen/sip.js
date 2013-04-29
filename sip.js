@@ -705,6 +705,10 @@ function resolve(uri, action) {
   if(net.isIP(uri.host))
     return action([{protocol: uri.params.transport || 'UDP', address: uri.host, port: uri.port || 5060}]);
 
+  /* ws client may use randomly generated host name */
+  if (uri.params.transport === 'ws')
+    return action([{protocol: uri.params.transport, address: uri.host, port:''}]);
+
   function resolve46(host, cb) {
     dns.resolve4(host, function(e4, a4) {
       dns.resolve6(host, function(e6, a6) {
@@ -727,7 +731,7 @@ function resolve(uri, action) {
   }
   else {
     var protocols = uri.params.protocol ? [uri.params.protocol] : ['tcp', 'udp'];
-  
+
     var n = protocols.length;
     var addresses = [];
 
@@ -1037,11 +1041,19 @@ function getNextHop(rq) {
     if(typeof rq.headers.route === 'string')
       rq.headers.route = parsers.route({s: rq.headers.route, i:0});
 
-    hop = parseUri(rq.headers.route[0].uri);
-    if(hop.params.lr === undefined ) {
+    /* MT - Not sure this is right, but changed to always remove route element from list
+       (we should make sure it's our uri before removing) */
+    if (true) {
       rq.headers.route.shift();
-      rq.headers.route.push({uri: rq.uri});
-      rq.uri = hop;
+    }
+
+    if (rq.headers.route.length) {
+      hop = parseUri(rq.headers.route[0].uri);
+      if(hop.params.lr === undefined ) {
+        rq.headers.route.shift();
+        rq.headers.route.push({uri: rq.uri});
+        rq.uri = hop;
+      }
     }
   }
 
