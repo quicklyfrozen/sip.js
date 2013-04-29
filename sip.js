@@ -3,6 +3,7 @@ var net = require('net');
 var dns = require('dns');
 var assert = require('assert');
 var dgram = require('dgram');
+var websocket = require('ws');
 
 function debug(e) {
   if(e.stack) {
@@ -538,6 +539,71 @@ function makeTcpTransport(options, callback) {
   }
 }
 
+function makeWsTransport(options, callback) {
+  var connections = Object.create(null);
+
+  function init(ws) {
+    var refs = 0;
+
+    ws.on('message', function(data) { 
+	    var msg = parseMessage(data);
+    
+	    if(msg && checkMessage(msg)) {
+          // get remote info from via header
+          var address = msg.headers.via[0].host;
+          var port = msg.headers.via[0].port;
+
+          // Todo: track and remove connections when websocket is closed
+
+          var id = [address, port].join();
+
+          if (!connections[id]) {
+            connections[id] = function(onError) {
+              ++refs;
+              if(onError) ws.on('error', onError);
+
+              return {
+                release: function() {
+                  if(onError) ws.removeListener('error', onError);
+                  --refs;
+                  /* rely on client to close connection */
+                },
+                send: function(m) {
+                  var s = stringify(m);
+                  ws.send(s);
+                },
+                local: {protocol: 'WS'}
+              }
+            };
+          }
+
+	      callback(msg, {protocol: 'WS', address: address, port: port});
+	  }
+    });
+
+    ws.on('close',    function() { /* todo: clean up */ });
+    ws.on('error',    function() {});
+  }
+  
+  var server = new websocket.Server({ port: 8088 });
+  server.on('connection', function(ws) {
+    init(ws);
+  });
+
+  return {
+    open: function(remote, error, dontopen) {
+      var id = [remote.address, remote.port].join();
+
+      if(id in connections) return connections[id](error);
+
+      if(dontopen) return null;
+
+      throw new Error('WebSocket client not supported');
+    },
+    destroy: function() { server.close(); }
+  }
+}
+
 function makeUdpTransport(options, callback) {
   function onMessage(data, rinfo) {
     var msg = parseMessage(data);
@@ -589,6 +655,8 @@ function makeTransport(options, callback) {
     protocols.UDP = makeUdpTransport(options, callbackAndLog); 
   if(options.tcp === undefined || options.tcp)
     protocols.TCP = makeTcpTransport(options, callbackAndLog);
+  if(options.ws === undefined || options.ws)
+    protocols.WS = makeWsTransport(options, callbackAndLog);
 
   function wrap(obj, target) {
     return Object.create(obj, {send: {value: function(m) {
@@ -627,7 +695,7 @@ function makeTransport(options, callback) {
       var protos = protocols;
       protocols = [];
       Object.keys(protos).forEach(function(key) { protos[key].destroy(); });
-    },
+    }
   };
 }
 
