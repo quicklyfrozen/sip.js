@@ -589,6 +589,7 @@ function makeWsTransport(options, callback) {
   if (options.ws_port !== undefined) ws_opts.port = options.ws_port;
   if (options.ws_host !== undefined) ws_opts.host = options.ws_host;
   if (options.ws_server !== undefined) ws_opts.server = options.ws_server;
+  if (options.ws_path !== undefined) ws_opts.path = options.ws_path;
 
   var server = new websocket.Server(ws_opts);
   server.on('connection', function(ws) {
