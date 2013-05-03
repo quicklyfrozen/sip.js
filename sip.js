@@ -584,8 +584,13 @@ function makeWsTransport(options, callback) {
     ws.on('close',    function() { /* todo: clean up */ });
     ws.on('error',    function() {});
   }
-  
-  var server = new websocket.Server({ port: 8088 });
+
+  var ws_opts = {};
+  if (options.ws_port !== undefined) ws_opts.port = options.ws_port;
+  if (options.ws_host !== undefined) ws_opts.host = options.ws_host;
+  if (options.ws_server !== undefined) ws_opts.server = options.ws_server;
+
+  var server = new websocket.Server(ws_opts);
   server.on('connection', function(ws) {
     init(ws);
   });
