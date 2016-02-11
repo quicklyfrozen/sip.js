@@ -546,6 +546,12 @@ function makeWsTransport(options, callback) {
     var refs = 0;
 
     ws.on('message', function(data) { 
+        // Check for keep alive message
+        if (data === '\r\n') {
+          ws.send(data);
+          return;
+        }
+      
 	    var msg = parseMessage(data);
     
 	    if(msg && checkMessage(msg)) {
