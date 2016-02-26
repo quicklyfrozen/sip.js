@@ -523,7 +523,7 @@ function makeTcpTransport(options, callback) {
     init(stream, {protocol: 'TCP', address: stream.remoteAddress, port: stream.remotePort});
   });
 
-  server.listen(options.port || 5060, options.address);
+  server.listen({port: options.port || 5060, host: options.address, exclusive: !!options.exclusive});
 
   return {
     open: function(remote, error, dontopen) {
@@ -635,7 +635,7 @@ function makeUdpTransport(options, callback) {
   var port = options.port || 5060;
 
   var socket = dgram.createSocket(net.isIPv6(options.address) ? 'udp6' : 'udp4', onMessage); 
-  socket.bind(port, address);
+  socket.bind({port:port, address:address, exclusive: !!options.exclusive});
 
   return {
     open: function(remote, error) {
